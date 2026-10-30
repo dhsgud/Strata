@@ -3768,6 +3768,10 @@ int main(int argc, char** argv) {
         const long long wr = w ? std::atoll(w) : 0;
         if (n > 0 && n < o.adapt_every && wr > 0) { o.adapt_warm_every = n; o.adapt_warm_rounds = wr; }
     }
+    const int64_t resident_swap_limit = [] {
+        const char* v = std::getenv("STRATA_RESIDENT_SWAP_CAP");
+        return v != nullptr ? (int64_t) std::clamp(std::atoi(v), 1, 512) : (int64_t) 96;
+    }();
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
         try {
@@ -6515,7 +6519,10 @@ int main(int argc, char** argv) {
         if (io_pf_default || (io_pf_env != nullptr && std::atoi(io_pf_env) != 0)) {
             const char* th = std::getenv("STRATA_IO_PF_THREADS");
             src.set_io_prefetch(true, th != nullptr ? std::atoi(th) : 0);
-            if (src.io_prefetch() && io_pf_default) {
+            if (src.direct_read_ahead()) {
+                std::fprintf(stderr, "strata generate: file tier io prefetch ON: bounded O_DIRECT predictions into stage buffers; "
+                                     "actual decode reads take priority\n");
+            } else if (src.io_prefetch() && io_pf_default) {
                 const char* cv = std::getenv("STRATA_COLD_OVERLAP");
                 std::fprintf(stderr, "strata generate: file tier (Linux defaults, %s): page-cached experts "
                                      "computed from the mapping (STRATA_COLD_OVERLAP=%s), io prefetch with whole-blob preads on %s I/O threads, "
@@ -9138,15 +9145,15 @@ int main(int argc, char** argv) {
         if (resident_ok) {
             // --adapt-async: twice the exchange buffers - the second half bounces the copies in whose source is not
             // page-locked (an asynchronous copy instead of the driver's staged, synchronous one)
-            if (o.adapt_async && !src.reserve_exchanges(2 * std::min<int64_t>(o.adapt_swaps, 96), err,
-                                                        std::min<int64_t>(o.adapt_swaps, 96)))
+            if (o.adapt_async && !src.reserve_exchanges(2 * std::min<int64_t>(o.adapt_swaps, resident_swap_limit), err,
+                                                        std::min<int64_t>(o.adapt_swaps, resident_swap_limit)))
                 adapt_async_off(err.c_str());
             // pageable buffers would make every copy of a round synchronous (the driver stages them): that is the
             // blocking tier's cost, so the asynchronous tier is not worth running - said, and the blocking tier stays
             if (o.adapt_async && !src.exchange_pinned())
                 adapt_async_off("the exchange buffers could not be page-locked");
             if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
-                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
+                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, resident_swap_limit), err)) {
                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
                 return 1;
             }
@@ -11576,7 +11583,7 @@ int main(int argc, char** argv) {
         // exchange buffers, no RAM moves (see a_arena below)
         const bool a_arena = srcp == &arena_src;
         // as the blocking tier's exchange buffers; the arena has none, so its rounds are as large as the blocking tier's
-        const int64_t a_cap = a_arena ? o.adapt_swaps : std::min<int64_t>(o.adapt_swaps, 96);
+        const int64_t a_cap = a_arena ? o.adapt_swaps : std::min<int64_t>(o.adapt_swaps, resident_swap_limit);
         const auto a_env = [](const char* name, int def) {
             const char* v = std::getenv(name);
             return v != nullptr && *v != 0 ? std::atoi(v) : def;
@@ -15736,6 +15743,10 @@ int main(int argc, char** argv) {
                                drive.d.pcie_experts};
             };
             const DecSnap ds0 = dec_snap();
+            const double pool_gu0 = pool.ms_multi_gu, pool_q0 = pool.ms_multi_q, pool_down0 = pool.ms_multi_down;
+            const auto direct_io0 = src.direct_timing();
+            const uint64_t direct_dest0 = src.direct_destination_bytes();
+            const uint64_t direct_registered0 = src.direct_registered_batches();
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             double dt_adapt_wait = 0, dt_adapt_join = 0;   // the tier's wait before a window / join after the draft (ms, summed)
             const int64_t dt_sw0 = ajob ? a_swapped : adapt_nswaps;
@@ -16588,7 +16599,13 @@ int main(int argc, char** argv) {
                     !remote_opt && o.batch == 0) {
                     // up to kRamAdaptPerLayer pairs a layer: the layer's most routed experts outside the copy against its least
                     // routed ones in it, paired in that order while the outgoing one is still unused
-                    constexpr float kRamAdaptRouted = 2.0f, kRamAdaptUnused = 0.5f;
+                    constexpr float kRamAdaptRouted = 2.0f;
+                    // Opt-in: admit moderately used victims when the incoming expert has more demand.
+                    // Keep the stage-buffer reuse and file-read budget; expert bytes and routing never change.
+                    static const float kRamAdaptUnused = [] {
+                        const char* v = std::getenv("STRATA_RAM_ADAPT_UNUSED");
+                        return v != nullptr ? (float) std::clamp(std::atof(v), 0.0, 8.0) : 0.5f;
+                    }();
                     constexpr size_t kRamAdaptPerLayer = 4;
                     struct RamSwap { float gain; int32_t layer, in, out; };
                     std::vector<RamSwap> swaps;
@@ -16608,8 +16625,10 @@ int main(int argc, char** argv) {
                                           [&](int32_t a, int32_t b) { return u[a] > u[b]; });
                         std::partial_sort(outs.begin(), outs.begin() + (std::ptrdiff_t) no, outs.end(),
                                           [&](int32_t a, int32_t b) { return u[a] < u[b]; });
-                        for (size_t i = 0; i < ni && i < no && u[outs[i]] < kRamAdaptUnused; ++i)
-                            swaps.push_back({u[ins[i]] - u[outs[i]], (int32_t) l, ins[i], outs[i]});
+                        for (size_t i = 0; i < ni && i < no && u[outs[i]] < kRamAdaptUnused; ++i) {
+                            const float gain = u[ins[i]] - u[outs[i]];
+                            if (gain >= 1.0f) swaps.push_back({gain, (int32_t) l, ins[i], outs[i]});
+                        }
                     }
                     std::sort(swaps.begin(), swaps.end(),
                               [](const RamSwap& a, const RamSwap& b) { return a.gain > b.gain; });
@@ -16809,6 +16828,17 @@ int main(int argc, char** argv) {
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
                 const double w = (double) dec_windows, L = (double) g.n_layers;
+                std::fprintf(stderr, "strata decode CPU phases: gate/up %.3f, quantize %.3f, down %.3f ms/window\n",
+                             (pool.ms_multi_gu - pool_gu0) / w, (pool.ms_multi_q - pool_q0) / w,
+                             (pool.ms_multi_down - pool_down0) / w);
+                const auto direct_io1 = src.direct_timing();
+                if (direct_io1[3] > direct_io0[3])
+                    std::fprintf(stderr, "strata decode direct I/O: submit %.3f, completion wait %.3f, copy %.3f ms/window; "
+                                         "%.2f calls/window, %.1f MB/window read directly into the destination, %.2f registered batches/window (thread sums, may overlap)\n",
+                                 (direct_io1[0] - direct_io0[0]) / (w * 1e6), (direct_io1[1] - direct_io0[1]) / (w * 1e6),
+                                 (direct_io1[2] - direct_io0[2]) / (w * 1e6), (direct_io1[3] - direct_io0[3]) / w,
+                                 (src.direct_destination_bytes() - direct_dest0) / (w * 1e6),
+                                 (src.direct_registered_batches() - direct_registered0) / w);
                 if (!pl_ran) {
                     const double dt_other = decode_ms - dt_adapt_wait - dt_run - dt_commit - dt_draft - dt_adapt_join;
                     std::fprintf(stderr,
