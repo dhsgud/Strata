@@ -1,5 +1,6 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
+#include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
@@ -42,6 +43,42 @@
 #endif
 
 namespace fs = std::filesystem;
+
+#if defined(__linux__)
+namespace strata::core {
+struct FileExpertSourceTestAccess {
+    static bool cold_cpu(FileExpertSource& source, int cpu) {
+        if (!source.async_worker_) return false;
+        bool pinned = false;
+        source.async_worker_->post([&] {
+            cpu_set_t mask;
+            CPU_ZERO(&mask);
+            pinned = sched_getaffinity(0, sizeof mask, &mask) == 0 && CPU_COUNT(&mask) == 1 && CPU_ISSET(cpu, &mask);
+        });
+        source.async_worker_->wait();
+        return pinned;
+    }
+    static size_t stages(FileExpertSource& source) {
+        std::lock_guard<std::mutex> lk(source.stage_mu_);
+        return source.stage_buf_.size();
+    }
+    static bool direct(FileExpertSource& source, int64_t layer, const std::vector<int64_t>& ids,
+                       const std::vector<uint8_t*>& bytes, const std::function<void(size_t)>& landed) {
+        FileExpertSource::DecodeScope decode;
+        std::vector<FileExpertSource::Fill> fills;
+        for (size_t i = 0; i < ids.size(); ++i) fills.push_back({i, layer, ids[i], bytes[i]});
+        return source.read_direct(fills.data(), fills.size(), landed);
+    }
+    static bool direct(FileExpertSource& source, int64_t layer, const std::vector<int64_t>& ids,
+                       std::vector<std::vector<uint8_t>>& bytes, const std::function<void(size_t)>& landed) {
+        std::vector<uint8_t*> ptr;
+        for (auto& b : bytes) ptr.push_back(b.data());
+        return direct(source, layer, ids, ptr, landed);
+    }
+    static uint64_t alignment(const FileExpertSource& source) { return source.direct_dest_align_; }
+};
+}
+#endif
 
 namespace {
 
@@ -576,7 +613,7 @@ void set_env(const char* name, const char* value) {
 // bytes as the mapping - one blob at a time, a batch of adjacent experts (merged into one request), and copy_blob - and
 // never falls back to the mapping.  The pack lives in the working directory, not the temp directory: a tmpfs /tmp has
 // no O_DIRECT, and there the test says so and skips.
-void test_unbuffered_reads() {
+void test_unbuffered_reads(bool destination = false) {
     using namespace strata::core;
     using namespace strata::kernels::cpu;
     constexpr int64_t layers = 2;
@@ -600,9 +637,11 @@ void test_unbuffered_reads() {
     FileExpertSource source;
     require(source.open(dir.path.string(), layers, experts, err), "could not map the synthetic pack: " + err);
     set_env("STRATA_UNBUFFERED_LOAD", "1");
+    if (destination) set_env("STRATA_DIRECT_DEST", "1");
     std::string why;
     const bool unbuffered = source.set_unbuffered(0, why);
     set_env("STRATA_UNBUFFERED_LOAD", nullptr);
+    if (destination) set_env("STRATA_DIRECT_DEST", nullptr);
 #if defined(_WIN32) || defined(__linux__)
     if (!unbuffered) {
         std::cout << "file_expert_source_test: unbuffered reads skipped (" << why << ")\n";
@@ -615,6 +654,58 @@ void test_unbuffered_reads() {
     return;
 #endif
     require(source.unbuffered(), "set_unbuffered succeeded but the source is not unbuffered");
+#if defined(__linux__)
+    int owned_cpu = -1;
+    const char* cpu_env = std::getenv("STRATA_COLD_CPU");
+    const char* persistent_env = std::getenv("STRATA_COLD_PERSISTENT");
+    if (cpu_env && persistent_env && std::atoi(persistent_env) != 0) {
+        owned_cpu = std::atoi(cpu_env);
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        require(sched_getaffinity(0, sizeof allowed, &allowed) == 0 && owned_cpu >= 0 &&
+                    owned_cpu < CPU_SETSIZE && CPU_ISSET(owned_cpu, &allowed), "test CPU is not available");
+        int host = 0;
+        while (host < CPU_SETSIZE && !CPU_ISSET(host, &allowed)) ++host;
+        require(strata::aux_cpus::configure("auto", err), "configure auxiliary affinity");
+        (void) strata::aux_cpus::set_topology(host, {});
+    }
+#endif
+    {
+        FileExpertSource::DecodeScope decode;
+        const int64_t ids[2] = {2, 0};
+        uint8_t pending[2] = {};
+        require(source.prefetch_begin(0, ids, 2, pending) == 2, "cold asynchronous reads were not queued");
+        while (pending[0] == 1 || pending[1] == 1) {
+            require(source.wait_landed(0, ids, 2, pending) > 0, "asynchronous reads made no progress");
+            for (size_t i = 0; i < 2; ++i) {
+                if (pending[i] != 2) continue;
+                const uint8_t* b = source.blob(0, ids[i]);
+                require(b && std::memcmp(b, bytes.data() + ids[i] * BLOB, BLOB) == 0,
+                        "an asynchronous publication exposed incomplete bytes");
+                pending[i] = 3;
+            }
+        }
+        source.prefetch_end();
+    }
+#if defined(__linux__)
+    if (owned_cpu >= 0) {
+        for (int request = 0; request < 3; ++request) {
+            strata::aux_cpus::set_enabled(true);
+            (void) strata::aux_cpus::sweep();
+            require(FileExpertSourceTestAccess::cold_cpu(source, owned_cpu), "request sweep moved the explicit I/O worker");
+            strata::aux_cpus::set_enabled(false);
+            require(FileExpertSourceTestAccess::cold_cpu(source, owned_cpu), "auxiliary restore moved the explicit I/O worker");
+        }
+        std::cout << "cold worker affinity survives request sweeps and restores: PASS\n";
+    }
+#endif
+    if (!destination) {
+        const char* v = std::getenv("STRATA_DIRECT_REGISTERED");
+        if (v && std::atoi(v) != 0) {
+            require(source.direct_registered_batches() > 0, "registered read test did not exercise io_uring");
+            std::cout << "registered asynchronous publication: exact bytes PASS\n";
+        }
+    }
     const int64_t batch[experts] = {0, 1, 2};
     source.prefetch(1, batch, experts);   // layer 1 in one batch: three adjacent blobs
     for (int64_t l = 0; l < layers; ++l)
@@ -630,6 +721,71 @@ void test_unbuffered_reads() {
                 std::memcmp(copy.data(), bytes.data() + (size_t) (2 * BLOB), (size_t) BLOB) == 0,
             "an unbuffered copy_blob differs from the file");
     require(source.direct_fallbacks() == 0, "an unbuffered read fell back to the mapping");
+#if defined(__linux__)
+    if (destination && FileExpertSourceTestAccess::alignment(source) == 512)
+        require(source.direct_destination_bytes() >= total, "stage buffers did not use direct destination reads");
+    std::vector<std::unique_ptr<uint8_t, decltype(&std::free)>> aligned;
+    std::vector<uint8_t*> dst;
+    for (size_t i = 0; i < 3; ++i) {
+        void* p = nullptr;
+        require(posix_memalign(&p, 4096, (size_t) BLOB + 8192) == 0, "aligned read fixture allocation failed");
+        aligned.emplace_back((uint8_t*) p, &std::free);
+        std::memset(p, 0xa5, (size_t) BLOB + 8192);
+        dst.push_back((uint8_t*) p + 512 + (i == 1 ? 1 : 0));
+    }
+    {
+        const std::vector<int64_t> ids{2, 0, 1};
+        bool valid = true;
+        std::vector<int> seen(3, 0);
+        const uint64_t before = source.direct_destination_bytes();
+        require(FileExpertSourceTestAccess::direct(source, 1, ids, dst, [&](size_t i) {
+            valid = (++seen[i] == 1 && std::memcmp(dst[i], bytes.data() + layer_bytes + ids[i] * BLOB, BLOB) == 0) && valid;
+        }), "mixed aligned and scratch destination read failed");
+        require(valid && std::all_of(seen.begin(), seen.end(), [](int n) { return n == 1; }), "destination publication changed bytes");
+        for (const uint8_t* b : dst) require(b[-1] == 0xa5 && b[BLOB] == 0xa5, "direct destination wrote outside the blob");
+        if (destination && FileExpertSourceTestAccess::alignment(source) == 512)
+            require(source.direct_destination_bytes() - before == 2 * BLOB, "eligible destination reads still used a scratch copy");
+        if (!destination) require(source.direct_destination_bytes() == 0, "direct destination was enabled by default");
+    }
+    // Completion callbacks see every byte of their expert, including unaligned file ranges.
+    // Both a merged adjacent request and separate non-adjacent requests use this path.
+    for (const std::vector<int64_t>& ids : {std::vector<int64_t>{2, 0, 1}, std::vector<int64_t>{2, 0}}) {
+        std::vector<std::vector<uint8_t>> out(ids.size(), std::vector<uint8_t>((size_t) BLOB, 0xcc));
+        std::vector<int> seen(ids.size(), 0);
+        bool valid = true;
+        require(FileExpertSourceTestAccess::direct(source, 1, ids, out, [&](size_t i) {
+            valid = (++seen[i] == 1) && valid;
+            valid = (std::memcmp(out[i].data(), bytes.data() + layer_bytes + ids[i] * BLOB, BLOB) == 0) && valid;
+        }), "completion-driven direct read failed");
+        require(valid, "completion published duplicate, incomplete or wrong bytes");
+        require(std::all_of(seen.begin(), seen.end(), [](int n) { return n == 1; }), "an expert was not published");
+    }
+    // A short read fails its expert, while a valid expert from the same batch stays published.
+    // No mapped bytes are touched after truncation; the source is closed immediately afterwards.
+    fs::resize_file(dir.path / "experts.bin", layer_bytes + BLOB);
+    const std::vector<int64_t> ids{0, 2};
+    std::vector<std::vector<uint8_t>> out(2, std::vector<uint8_t>((size_t) BLOB, 0xcc));
+    std::vector<int> seen(2, 0);
+    bool valid = true;
+    require(!FileExpertSourceTestAccess::direct(source, 1, ids, out, [&](size_t i) {
+        valid = (i == 0 && ++seen[i] == 1) && valid;
+        valid = (std::memcmp(out[i].data(), bytes.data() + layer_bytes, BLOB) == 0) && valid;
+    }), "truncated expert was accepted");
+    require(valid, "partial-batch publication exposed invalid bytes");
+    require(seen[0] == 1 && seen[1] == 0, "a partial batch did not preserve its valid completion");
+    if (destination) {
+        const std::vector<uint8_t*> ptr{dst[0], dst[2]};
+        seen.assign(2, 0);
+        valid = true;
+        require(!FileExpertSourceTestAccess::direct(source, 1, ids, ptr, [&](size_t i) {
+            valid = (i == 0 && ++seen[i] == 1 && std::memcmp(ptr[i], bytes.data() + layer_bytes, BLOB) == 0) && valid;
+        }), "a truncated direct destination read succeeded");
+        require(valid && seen[0] == 1 && seen[1] == 0, "a failed direct destination was published");
+        for (const uint8_t* b : ptr) require(b[-1] == 0xa5 && b[BLOB] == 0xa5, "a short direct read wrote outside its destination");
+        std::cout << "direct destination: alignment " << FileExpertSourceTestAccess::alignment(source)
+                  << ", bytes " << source.direct_destination_bytes() << ": PASS\n";
+    }
+#endif
     source.close();
 }
 
@@ -699,7 +855,36 @@ void test_host_memory() {
 
 // STRATA_IO_PREFETCH: the experts.bin file tier hands out the same bytes with the Linux I/O path on (whole-blob
 // preads, the read-ahead workers, the mapping for cached blobs), however the reads and the predictions interleave.
-void test_io_prefetch() {
+void test_direct_startup_stages() {
+#if defined(__linux__)
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    TempDirectory dir(fs::current_path());
+    constexpr int64_t experts = 300;
+    std::string err, why;
+    require(expert_layout_load(dir.path.string(), 1, experts, err), "startup stage layout failed");
+    create_pack(dir.path, (uint64_t) experts * BLOB);
+    FileExpertSource source;
+    require(source.open(dir.path.string(), 1, experts, err), "startup stage source failed");
+    set_env("STRATA_UNBUFFERED_LOAD", "1");
+    require(source.set_unbuffered(0, why), "startup stage O_DIRECT failed: " + why);
+    set_env("STRATA_UNBUFFERED_LOAD", nullptr);
+    set_env("STRATA_DIRECT_READAHEAD", "1");
+    source.set_io_prefetch(true, 2);
+    set_env("STRATA_DIRECT_READAHEAD", nullptr);
+    // Startup fills GPU slots before the first begin_layer. No epoch advances yet.
+    for (int64_t e = 0; e < experts; ++e) require(source.blob(0, e) != nullptr, "startup stage read failed");
+    require(FileExpertSourceTestAccess::stages(source) <= 256, "direct read-ahead made startup retain every expert");
+    // A later batched prompt also reads many experts without advancing decode layers.
+    source.begin_layer(0, nullptr, 0);
+    for (int64_t e = 0; e < experts; ++e) require(source.blob(0, e) != nullptr, "later prompt stage read failed");
+    require(FileExpertSourceTestAccess::stages(source) <= 256, "direct read-ahead made a later prompt retain every expert");
+    require(source.direct_fallbacks() == 0, "startup stage fell back to the mapping");
+    std::cout << "direct startup: " << FileExpertSourceTestAccess::stages(source) << " reusable buffers: PASS\n";
+#endif
+}
+
+void test_io_prefetch(bool direct = false) {
     using namespace strata::core;
     using namespace strata::kernels::cpu;
     constexpr int64_t layers = 3;
@@ -722,9 +907,49 @@ void test_io_prefetch() {
     }
     FileExpertSource source;
     require(source.open(dir.path.string(), layers, experts, err), "could not map the synthetic pack: " + err);
+    if (direct) {
+#if defined(__linux__)
+        set_env("STRATA_UNBUFFERED_LOAD", "1");
+        std::string why;
+        const bool opened = source.set_unbuffered(0, why);
+        set_env("STRATA_UNBUFFERED_LOAD", nullptr);
+        require(opened, "direct read-ahead fixture could not open O_DIRECT: " + why);
+        source.set_io_prefetch(true, 3);
+        require(!source.io_prefetch(), "direct read-ahead was enabled without its opt-in");
+        set_env("STRATA_DIRECT_READAHEAD", "1");
+        set_env("STRATA_IO_PF_BUDGET_MB", "4");
+#else
+        return;
+#endif
+    }
     source.set_io_prefetch(true, 3);
+    if (direct) {
+        set_env("STRATA_DIRECT_READAHEAD", nullptr);
+        set_env("STRATA_IO_PF_BUDGET_MB", nullptr);
+    }
 #if defined(__linux__)
     require(source.io_prefetch() && source.warms(), "io prefetch did not turn on");
+    if (direct) {
+        require(source.wants_scores(), "direct predictions bypassed the scheduler");
+        const int64_t ids[2] = {0, 1};
+        source.warm(0, ids, 2);
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (source.io_counters().pf_read_blobs < 2 && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(source.io_counters().pf_read_blobs == 2, "direct predictions did not actually read the experts");
+        for (int64_t e : ids) {
+            const uint8_t* b = source.blob(0, e);
+            require(b && std::memcmp(b, bytes.data() + e * BLOB, BLOB) == 0, "direct prediction changed bytes");
+        }
+        require(source.io_counters().pf_used == 2, "demand did not reuse direct predictions");
+        const float low[2] = {0.0f, 0.0f};
+        source.warm_scored(1, ids, low, 2, 1);
+        require(source.io_counters().pf_rej_conf >= 2, "low-confidence direct predictions were admitted");
+        const int64_t many[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+        source.warm(1, many, 8);
+        const auto c = source.io_counters();
+        require(c.pf_rej_budget > 0 && c.pf_budget_bytes <= (4ull << 20), "direct predictions ignored the byte budget");
+    }
     // predictions for the next layers, some of them wrong or repeated, while the layers are read
     for (int round = 0; round < 20; ++round)
         for (int64_t l = 0; l < layers; ++l) {
@@ -749,8 +974,9 @@ void test_io_prefetch() {
                 std::memcmp(copy.data(), bytes.data() + (size_t) (layer_bytes + 6 * BLOB), (size_t) BLOB) == 0,
             "an io-prefetch copy_blob differs from the file");
     const FileExpertSource::IoCounters c = source.io_counters();
-    require(c.cached_bytes + c.uncached_bytes > 0, "no residency counted");
-    std::cout << "io prefetch: " << c.pf_read_blobs << " read ahead, " << c.pf_used << " used, " << c.pf_resident_skips
+    if (direct) require(source.direct_fallbacks() == 0, "direct predictions fell back to mapped reads");
+    else require(c.cached_bytes + c.uncached_bytes > 0, "no residency counted");
+    std::cout << (direct ? "direct read-ahead: " : "io prefetch: ") << c.pf_read_blobs << " read ahead, " << c.pf_used << " used, " << c.pf_resident_skips
               << " skipped, pread " << c.pread_bytes << " B: bytes PASS\n";
 #else
     require(!source.io_prefetch(), "io prefetch on a platform without it");
@@ -1052,7 +1278,10 @@ int main(int argc, char** argv) {
         test_host_memory();
         test_canonical_layout();
         test_unbuffered_reads();
+        test_unbuffered_reads(true);
         test_io_prefetch();
+        test_io_prefetch(true);
+        test_direct_startup_stages();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
 #endif

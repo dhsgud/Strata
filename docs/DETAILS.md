@@ -278,6 +278,41 @@ For an `experts.bin` pack, io prefetch and the gate switch on when the page cach
 names what is on. Windows and macOS are unchanged. On a Radeon 780M iGPU, prefetch together with the adaptive tier under
 memory pressure reset the GPU in most runs; with `--adapt-every 100000` there were none, and the cause is not found.
 
+This local experimental build also has opt-in Linux direct-read paths. They retain the expert bytes and the model's
+actual routing. They do not change the number of routed experts or the KV format.
+
+- `STRATA_DIRECT_COMPLETION=1`, with `STRATA_COLD_OVERLAP=1`: publish each expert as its Linux AIO reads complete.
+  An expert assembled from three role slices is published only after all three arrive. A partial read cannot publish
+  that expert, and fallback never overwrites an expert already handed to the CPU.
+- `STRATA_COLD_PERSISTENT=1`: keep the cold-read worker and its AIO context between layers when one worker is enough.
+  `STRATA_COLD_CPU=N` optionally pins that worker to one Linux logical CPU; otherwise it keeps the auxiliary affinity.
+  An explicit successful pin is preserved across request-boundary auxiliary sweeps and affinity restores.
+- `STRATA_DIRECT_DEST=1`: for a packed `experts.bin`, probe the file's direct-read alignment and read eligible blobs
+  straight into their destination. Stage buffers are aligned pageable allocations; this does not enable stage pinning.
+  Misaligned destinations and separate GGUF role slices keep the scratch-copy path. Reads write exactly the blob's
+  byte range, with no padding into adjacent storage.
+- `STRATA_DIRECT_READAHEAD=1`, with `STRATA_IO_PREFETCH=1` and an unbuffered file tier: reuse the router predictor and
+  staging pool for O_DIRECT reads. Predictions expire when their layer is reached. New speculative reads are dropped
+  while a decode demand read is active. There are at most two I/O workers, 32 MiB of admitted reads per window by
+  default (`STRATA_IO_PF_BUDGET_MB`, capped at 64), and at most 64 MiB of unconsumed predictions in the staging pool.
+  The page-cache gate is disabled for this mode: page-cache occupancy does not describe O_DIRECT reuse. Residency
+  snapshots are hints for read admission; actual expert selection still comes from the model.
+- `STRATA_DIRECT_TIMING=1`, with `STRATA_DECODE_TIMING=1`: report AIO submission, completion wait and staging copy
+  time per decode window. These are sums across threads and can overlap; they must not be added to wall-clock time.
+  Decode timing also reports gate/up, intermediate quantization and down-projection time in the CPU pool.
+- `STRATA_DIRECT_POLL_US=N` (0 by default, capped at 2000): during a decode demand read, poll completions for at most
+  this many microseconds per batch before sleeping. This trades auxiliary CPU time for fewer sleep/wake transitions.
+- `STRATA_DIRECT_REGISTERED=1`: on Linux, decode read batches fitting 6 MiB use a private io_uring registered buffer.
+  This avoids repeated page registration for O_DIRECT. Larger batches, direct destinations, unavailable io_uring or
+  insufficient locked-memory allowance use the existing AIO path. The completion checks and expert publication are
+  shared by both paths. The registered buffer is a separate anonymous mapping, never a caller's expert destination.
+  See the [liburing registered-buffer documentation](https://raw.githubusercontent.com/axboe/liburing/master/man/io_uring_register_buffers.3).
+
+`file_expert_source_test` covers complete bytes at publication, partial-read failures, direct read-ahead reuse and its
+admission budget, and explicit worker affinity across repeated sweeps/restores. Run the test in a directory on a
+filesystem supporting O_DIRECT. These local additions have been
+built and tested on Linux/CUDA; they have not been validated on HIP, SYCL or Windows.
+
 The weights and the MTP draft files are asked for ahead of their reads at start (madvise and `posix_fadvise` WILLNEED, 128 KiB
 steps), which matters on a slow drive: `STRATA_READ_AHEAD=0` turns it off, `STRATA_FILL_AHEAD=N` sets how many fill pairs
 are requested ahead (default 256).

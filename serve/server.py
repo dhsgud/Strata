@@ -5284,6 +5284,7 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        sampling = context_tuning(sampling, len(ids))
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
@@ -8419,6 +8420,19 @@ def apply_saved_tuning(cfg: dict, *, say=None) -> dict:
         return cfg
 
 
+def context_tuning(sampling: dict | None, prompt_tokens: int) -> dict | None:
+    """Opt-in: apply strata_tune only at or above its min_context_tokens threshold.
+
+    Below the threshold the engine keeps its startup tuning. The request's own
+    strata_tune already replaces the configured one, so an explicit override wins.
+    """
+    tune = (sampling or {}).get("strata_tune")
+    minimum = tune.get("min_context_tokens") if isinstance(tune, dict) else None
+    if isinstance(minimum, int) and not isinstance(minimum, bool) and minimum > 0 and prompt_tokens < minimum:
+        return {**sampling, "strata_tune": {}}
+    return sampling
+
+
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
@@ -8478,7 +8492,11 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
         elif key == "strata_tune":           # a saved tuning's per-request settings (strata_control/presets.py)
             if not isinstance(value, dict):
                 raise SystemExit(f"[strata] config sampling.strata_tune={value!r}: expected an object")
-            out[key] = {k: v for k, v in value.items() if k in ("pcie_frac", "spec_min_p", "aux_cpus")}
+            if "min_context_tokens" in value:
+                minimum = value["min_context_tokens"]
+                if not isinstance(minimum, int) or isinstance(minimum, bool) or minimum < 0:
+                    raise SystemExit("[strata] config sampling.strata_tune.min_context_tokens: expected a non-negative integer")
+            out[key] = {k: v for k, v in value.items() if k in ("pcie_frac", "spec_min_p", "aux_cpus", "min_context_tokens")}
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
                 raise SystemExit(f"[strata] config sampling.experimental_speed_projection={value!r}: expected true or "
