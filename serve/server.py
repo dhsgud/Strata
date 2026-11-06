@@ -3979,8 +3979,11 @@ def slot_save_dir(value, base: str | None = None) -> str:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = True):
+                 fit_max_tokens: bool = True, auto_prefix_min_tokens: int = 0):
+        if isinstance(auto_prefix_min_tokens, bool) or not isinstance(auto_prefix_min_tokens, int) or auto_prefix_min_tokens < 0:
+            raise ValueError('auto_prefix_min_tokens must be a non-negative integer (0 disables it)')
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.auto_prefix_min_tokens = auto_prefix_min_tokens
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
@@ -5121,6 +5124,17 @@ class Service:
             lead = self.deepseek_shared_start(messages)
             if lead:
                 req["strata_prefix"] = {"messages": lead}
+        if (req is not None and "strata_prefix" not in req and req.get("strata_checkpoint") is not False
+                and not images and not ds_pics and self.auto_prefix_min_tokens > 0
+                and len(ids) >= self.auto_prefix_min_tokens + 2048):
+            prefix = {}
+            if len(messages) > 1:
+                prefix = self.resolve_prefix({"messages": len(messages) - 1}, messages, tools, kwargs, ids)
+            if prefix.get("tokens", 0) < self.auto_prefix_min_tokens:
+                # ponytail: one-message boundaries are approximate; explicit strata_prefix gives an exact boundary.
+                # Leave 1-2K tokens for changing questions; explicit strata_prefix wins.
+                prefix = {"tokens": (len(ids) - 1024) // 1024 * 1024}
+            req["strata_prefix"] = prefix
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images) or ds_pics)
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
@@ -5284,6 +5298,7 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        sampling = context_tuning(sampling, len(ids))
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
@@ -8419,6 +8434,19 @@ def apply_saved_tuning(cfg: dict, *, say=None) -> dict:
         return cfg
 
 
+def context_tuning(sampling: dict | None, prompt_tokens: int) -> dict | None:
+    """Opt-in: apply strata_tune only at or above its min_context_tokens threshold.
+
+    Below the threshold the engine keeps its startup tuning. The request's own
+    strata_tune already replaces the configured one, so an explicit override wins.
+    """
+    tune = (sampling or {}).get("strata_tune")
+    minimum = tune.get("min_context_tokens") if isinstance(tune, dict) else None
+    if isinstance(minimum, int) and not isinstance(minimum, bool) and minimum > 0 and prompt_tokens < minimum:
+        return {**sampling, "strata_tune": {}}
+    return sampling
+
+
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
@@ -8478,7 +8506,11 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
         elif key == "strata_tune":           # a saved tuning's per-request settings (strata_control/presets.py)
             if not isinstance(value, dict):
                 raise SystemExit(f"[strata] config sampling.strata_tune={value!r}: expected an object")
-            out[key] = {k: v for k, v in value.items() if k in ("pcie_frac", "spec_min_p", "aux_cpus")}
+            if "min_context_tokens" in value:
+                minimum = value["min_context_tokens"]
+                if not isinstance(minimum, int) or isinstance(minimum, bool) or minimum < 0:
+                    raise SystemExit("[strata] config sampling.strata_tune.min_context_tokens: expected a non-negative integer")
+            out[key] = {k: v for k, v in value.items() if k in ("pcie_frac", "spec_min_p", "aux_cpus", "min_context_tokens")}
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
                 raise SystemExit(f"[strata] config sampling.experimental_speed_projection={value!r}: expected true or "
@@ -9046,6 +9078,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
+                  auto_prefix_min_tokens=cfg.get("auto_prefix_min_tokens", 0),
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
     svc.launch_attestation = launch_attestation
     if (cfg.get("arch") or "") == "deepseek41" and vision is None and a.engine == "strata":

@@ -25,6 +25,7 @@
 #include "strata/core/pinned.hpp"
 #include "strata/core/exchange_storage.hpp"
 #include "strata/core/hit_hook.hpp"
+#include "strata/core/persistent_job.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 
 #include <algorithm>
@@ -353,6 +354,7 @@ private:
     bool quit_ = false, pending_ = false, busy_ = false;
     int64_t layer_ = -1, n_tok_ = 0;
     const int32_t* host_res_ = nullptr;
+    std::vector<int32_t> host_res_snapshot_;      ///< direct read-ahead: the submitting thread owns live residency
     uint64_t sub_gen_ = 0;
     ForesightSwap* fs_ = nullptr;                   ///< (under mu_)
     std::vector<float> x_;
@@ -942,12 +944,19 @@ public:
     bool io_sched() const { return io_sched_; }
     bool wants_scores() const override { return io_sched_ && io_pf_; }
     /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
-    bool warms() const override { return (!role_ptr_.empty() || io_pf_) && direct_.empty(); }
+    bool warms() const override { return io_pf_ || (!role_ptr_.empty() && direct_.empty()); }
     /// Of the blobs the file tier read for the decode, how many had been warmed for their layer beforehand.
     int64_t warmed_hits() const { return warm_hits_.load(std::memory_order_relaxed); }
     int64_t warmed() const { return warm_count_.load(std::memory_order_relaxed); }
     /// #286: blobs an unbuffered read could not deliver, read through the mapping instead (0 when all went direct).
     int64_t direct_fallbacks() const { return direct_fallbacks_.load(std::memory_order_relaxed); }
+    uint64_t direct_destination_bytes() const { return direct_destination_bytes_.load(std::memory_order_relaxed); }
+    uint64_t direct_registered_batches() const { return direct_registered_batches_.load(std::memory_order_relaxed); }
+    std::array<uint64_t, 4> direct_timing() const {
+        std::array<uint64_t, 4> r{};
+        for (size_t i = 0; i < r.size(); ++i) r[i] = direct_timing_[i].load(std::memory_order_relaxed);
+        return r;
+    }
 
     /// Blobs touched, for the driver to report.  With `h = 0` this is `48 * k` per token and the number is only
     /// interesting once Phase 3 makes it not so.
@@ -965,6 +974,7 @@ public:
     // The bytes are the same bytes, so the output is the same.  `threads` = I/O threads (0: default 4).
     void set_io_prefetch(bool on, int threads);
     bool io_prefetch() const { return io_pf_; }
+    bool direct_read_ahead() const { return io_direct_; }
     /// blob() hands out stage buffers it recycles (the GGUF in place, an unbuffered source, the I/O read-ahead): one
     /// thread at a time (STRATA_PIPED_CONCURRENT is off with such a source)
     bool stages_blobs() const { return staged(); }
@@ -991,6 +1001,7 @@ public:
 
 private:
     const uint8_t* resident_blob(size_t index) const;
+    friend struct FileExpertSourceTestAccess;
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
     bool copy_from_files(int64_t layer, int64_t expert, uint8_t* dst) const;
@@ -1061,13 +1072,17 @@ private:
     int64_t gate_closed_w_ = 0, gate_flips_ = 0;
     std::vector<Fill> async_todo_;
     std::vector<std::thread> async_th_;
+    std::unique_ptr<detail::PersistentJob> async_worker_;
+    bool async_worker_active_ = false;
     std::atomic<size_t> async_next_{0};
     std::atomic<int64_t> async_end_ns_{0};
     std::chrono::steady_clock::time_point async_t0_{};
     double async_fill_us_ = 0;
     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
-    bool read_direct(const Fill* fills, size_t n) const;
+    // Linux: landed(i) publishes only fill i, after all of its role slices have arrived.
+    // A failed call may already have published other fills; callers must not rewrite them.
+    bool read_direct(const Fill* fills, size_t n, const std::function<void(size_t)>& landed = {}) const;
     bool open_direct(std::string& why);
     /// Windows: experts.bin mapped again as `open` maps it (begin/end_startup_unbuffered).
     bool map_view(std::string& why);
@@ -1105,6 +1120,7 @@ private:
     // header has no cuda_runtime.h).
     struct StageBufFree {
         bool pinned = false;
+        bool aligned = false;
         void operator()(uint8_t* p) const noexcept;
     };
     std::mutex stage_mu_;
@@ -1118,6 +1134,10 @@ private:
     std::unique_ptr<std::atomic<uint32_t>[]> warm_stamp_;   ///< per (layer, expert): epoch_ + 1 when warmed
     std::atomic<int64_t> warm_hits_{0}, warm_count_{0};
     mutable std::atomic<int64_t> direct_fallbacks_{0};
+    uint64_t direct_dest_align_ = 0;                    ///< opt-in packed reads directly into aligned caller-owned storage
+    mutable std::atomic<uint64_t> direct_destination_bytes_{0};
+    mutable std::atomic<uint64_t> direct_registered_batches_{0};
+    mutable std::array<std::atomic<uint64_t>, 4> direct_timing_{}; ///< submit, completion wait, copy nanoseconds; calls
     std::unordered_map<int64_t, size_t> stage_of_;
     uint64_t stage_blob_ = 0;
     uint64_t stage_seq_ = 0;
@@ -1150,6 +1170,9 @@ private:
     std::atomic<uint64_t> file_read_bytes_{0};
     // ---- the Linux I/O path (set_io_prefetch)
     bool io_pf_ = false;
+    bool io_direct_ = false;                          ///< opt-in bounded O_DIRECT predictions into the existing stage pool
+    mutable std::atomic<uint32_t> io_direct_demand_{0}; ///< actual decode reads take precedence over new predictions
+    std::unique_ptr<std::atomic<uint8_t>[]> io_resident_hint_; ///< refreshed by the decode owner; workers never read mutable RAM ownership
     bool io_fill_ = false;                            ///< experts.bin: the workers only fill the page cache (large preads), no staging, nothing waits
     bool io_ahead_ = true;                            ///< STRATA_IO_PF_AHEAD=0: no read-ahead workers' queue, demand preads only
     bool io_stats_ = false;
